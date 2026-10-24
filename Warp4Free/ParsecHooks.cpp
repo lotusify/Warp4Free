@@ -6,7 +6,6 @@
 
 #include <MinHook.h>
 
-#include <atomic>
 #include <cstring>
 #include <optional>
 #include <string>
@@ -17,8 +16,8 @@ struct HookState {
     UiUpdateFrame original_ui_update_frame = nullptr;
     RenderMainSettings original_render_main_settings = nullptr;
     RefreshAccountCapabilitiesNative original_refresh_account_capabilities_native = nullptr;
+    RefreshAccountCapabilitiesTwin original_refresh_account_capabilities_twin = nullptr;
     ConfigClearLayerValue config_clear_layer_value = nullptr;
-    std::atomic_bool stale_account_overrides_cleared = false;
 };
 
 static HookState hook_state;
@@ -49,7 +48,9 @@ static std::optional<ParsecSymbols> resolve_parsec_symbols(const memory::ModuleI
     if (!config_clear_layer_value)
         return std::nullopt;
 
-    return ParsecSymbols{*ui_update_frame, *render_main_settings, *refresh_account_capabilities_native, *config_clear_layer_value};
+    ParsecSymbols symbols{*ui_update_frame, *render_main_settings, *refresh_account_capabilities_native, *config_clear_layer_value, std::nullopt};
+    symbols.refresh_account_capabilities_twin = memory::find_unique_pattern(module, refresh_account_capabilities_twin_pattern);
+    return symbols;
 }
 
 static std::optional<ParsecSymbols> find_loaded_parsec_symbols() {
@@ -86,17 +87,13 @@ static void grant_warp_permissions(std::uint8_t* permissions) {
 }
 
 static void clear_stale_account_overrides() {
-    if (hook_state.config_clear_layer_value == nullptr || hook_state.stale_account_overrides_cleared.load(std::memory_order_acquire))
+    if (hook_state.config_clear_layer_value == nullptr)
         return;
 
-    bool all_cleared = true;
-    for (const ConfigLayerValue& value : warp_account_overrides) {
-        if (hook_state.config_clear_layer_value(account_config_layer, value.key, value.stream) == 0)
-            all_cleared = false;
-    }
-
-    if (all_cleared)
-        hook_state.stale_account_overrides_cleared.store(true, std::memory_order_release);
+    // Parsec re-applies the account-layer overrides on every capability/account event,
+    // so this has to run after each one rather than once at startup.
+    for (const ConfigLayerValue& value : warp_account_overrides)
+        hook_state.config_clear_layer_value(account_config_layer, value.key, value.stream);
 }
 
 static std::int64_t __fastcall ui_update_frame_detour(std::int64_t state, int width, int height, float scale, int flags, std::int64_t ui_state, std::int64_t ui_context, void* output, void* status, std::int64_t items, int* item_count) {
@@ -117,6 +114,22 @@ static std::int64_t __fastcall refresh_account_capabilities_native_detour(std::i
     const std::uint8_t original_capability = account_record[warp_capability_offset];
     account_record[warp_capability_offset] = 1;
     const std::int64_t result = hook_state.original_refresh_account_capabilities_native(refresh_state, ui_context, error_state, account_record, request_state, mode);
+    account_record[warp_capability_offset] = original_capability;
+
+    if (original_capability == 0)
+        clear_stale_account_overrides();
+    return result;
+}
+
+// Parsec compiles the same capability refresh a second time for the account update
+// callback; unhooked, it re-disables the Warp config values mid-session.
+static std::int64_t __fastcall refresh_account_capabilities_twin_detour(std::int64_t state, std::int64_t ui_context, std::uint8_t* account_record, std::int64_t account_object) {
+    if (account_record == nullptr)
+        return hook_state.original_refresh_account_capabilities_twin(state, ui_context, account_record, account_object);
+
+    const std::uint8_t original_capability = account_record[warp_capability_offset];
+    account_record[warp_capability_offset] = 1;
+    const std::int64_t result = hook_state.original_refresh_account_capabilities_twin(state, ui_context, account_record, account_object);
     account_record[warp_capability_offset] = original_capability;
 
     if (original_capability == 0)
@@ -152,6 +165,13 @@ void install_hooks() {
         || !create_hook(symbols->refresh_account_capabilities_native, reinterpret_cast<LPVOID>(refresh_account_capabilities_native_detour), hook_state.original_refresh_account_capabilities_native, L"refresh_account_capabilities_native")) {
         MH_Uninitialize();
         return;
+    }
+
+    if (symbols->refresh_account_capabilities_twin) {
+        if (!create_hook(*symbols->refresh_account_capabilities_twin, reinterpret_cast<LPVOID>(refresh_account_capabilities_twin_detour), hook_state.original_refresh_account_capabilities_twin, L"refresh_account_capabilities_twin"))
+            show_error(L"The account capability twin could not be hooked; Warp features may revert mid-session.");
+    } else {
+        show_error(L"The account capability twin signature was not found; Warp features may revert mid-session.");
     }
 
     status = MH_EnableHook(MH_ALL_HOOKS);
